@@ -143,13 +143,16 @@ public class PdfViewerActivity extends Activity {
             int sourceHeight = page.getHeight();
 
             // Keep rasterized pages modest in size; huge scanned PDFs can otherwise exhaust RAM.
-            double scale = Math.min(1.5, availableWidth / (double) sourceWidth);
-            double pixelLimitScale = Math.sqrt(3000000.0 / ((double) sourceWidth * sourceHeight));
-            scale = Math.min(scale, pixelLimitScale);
-            scale = Math.max(0.1, scale);
-            int width = Math.max(1, (int) (sourceWidth * scale));
-            int height = Math.max(1, (int) (sourceHeight * scale));
+            // Conservative raster budget for low-memory Android phones.
+            // Never force a minimum scale that could exceed the pixel budget.
+            double scale = Math.min(1.0, availableWidth / (double) sourceWidth);
+            scale = Math.min(scale, 1600.0 / sourceWidth);
+            scale = Math.min(scale, 1200.0 / sourceHeight);
+            scale = Math.min(scale, Math.sqrt(1200000.0 / ((double) sourceWidth * sourceHeight)));
+            int width = Math.max(1, (int) Math.floor(sourceWidth * scale));
+            int height = Math.max(1, (int) Math.floor(sourceHeight * scale));
 
+            // RGB_565 uses about 2 bytes/pixel, keeping the working bitmap near 2.4 MB max.
             bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.RGB_565);
             bitmap.eraseColor(Color.WHITE);
             page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY);
