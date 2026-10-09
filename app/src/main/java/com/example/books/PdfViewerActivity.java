@@ -5,9 +5,10 @@ import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.graphics.pdf.PdfRenderer;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.ParcelFileDescriptor;
 import android.view.Gravity;
-import android.view.View;
 import android.widget.Button;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
@@ -16,6 +17,8 @@ import android.widget.TextView;
 import android.widget.Toast;
 import java.io.File;
 import java.io.IOException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 public class PdfViewerActivity extends Activity {
     private ParcelFileDescriptor descriptor;
@@ -23,6 +26,11 @@ public class PdfViewerActivity extends Activity {
     private ImageView pageImage;
     private TextView pageLabel;
     private int pageIndex = 0;
+    private int requestId = 0;
+    private Bitmap displayedBitmap;
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private final ExecutorService pdfExecutor = Executors.newSingleThreadExecutor();
+    private volatile boolean destroyed = false;
 
     private int dp(float n) {
         return (int) (n * getResources().getDisplayMetrics().density + 0.5f);
@@ -41,7 +49,7 @@ public class PdfViewerActivity extends Activity {
         LinearLayout bar = new LinearLayout(this);
         bar.setGravity(Gravity.CENTER_VERTICAL);
         bar.setPadding(dp(8), dp(4), dp(8), dp(4));
-        bar.setBackgroundColor(Color.rgb(255, 255, 255));
+        bar.setBackgroundColor(Color.WHITE);
 
         Button previous = new Button(this);
         previous.setText("Previous");
@@ -52,6 +60,7 @@ public class PdfViewerActivity extends Activity {
         pageLabel = new TextView(this);
         pageLabel.setGravity(Gravity.CENTER);
         pageLabel.setTextColor(Color.rgb(32, 36, 43));
+        pageLabel.setText("Opening PDF…");
         bar.addView(pageLabel, new LinearLayout.LayoutParams(0, dp(48), 1));
 
         Button next = new Button(this);
@@ -76,41 +85,95 @@ public class PdfViewerActivity extends Activity {
             finish();
             return;
         }
-        try {
-            descriptor = ParcelFileDescriptor.open(new File(path), ParcelFileDescriptor.MODE_READ_ONLY);
-            renderer = new PdfRenderer(descriptor);
-            if (renderer.getPageCount() == 0) {
-                Toast.makeText(this, "This PDF has no pages.", Toast.LENGTH_LONG).show();
-                finish();
-                return;
+
+        // File opening and renderer setup can also take time, so do them off the UI thread.
+        pdfExecutor.execute(() -> {
+            try {
+                ParcelFileDescriptor opened = ParcelFileDescriptor.open(
+                    new File(path), ParcelFileDescriptor.MODE_READ_ONLY);
+                PdfRenderer openedRenderer = new PdfRenderer(opened);
+                if (destroyed) {
+                    openedRenderer.close();
+                    opened.close();
+                    return;
+                }
+                descriptor = opened;
+                renderer = openedRenderer;
+                if (renderer.getPageCount() == 0) {
+                    mainHandler.post(() -> {
+                        if (!destroyed) {
+                            Toast.makeText(this, "This PDF has no pages.", Toast.LENGTH_LONG).show();
+                            finish();
+                        }
+                    });
+                    return;
+                }
+                renderPage(0, ++requestId);
+            } catch (Exception e) {
+                mainHandler.post(() -> {
+                    if (!destroyed) {
+                        Toast.makeText(this, "Could not open this PDF. It may be damaged or protected.", Toast.LENGTH_LONG).show();
+                        finish();
+                    }
+                });
             }
-            showPage(0);
-        } catch (Exception e) {
-            Toast.makeText(this, "Could not open this PDF. The file may be damaged or protected.", Toast.LENGTH_LONG).show();
-            finish();
-        }
+        });
     }
 
     private void showPage(int requested) {
-        if (renderer == null) return;
-        if (requested < 0 || requested >= renderer.getPageCount()) return;
+        PdfRenderer current = renderer;
+        if (current == null || destroyed) return;
+        if (requested < 0 || requested >= current.getPageCount()) return;
         pageIndex = requested;
-        PdfRenderer.Page page = null;
+        int id = ++requestId;
+        pageLabel.setText("Loading " + (requested + 1) + "…");
+        pdfExecutor.execute(() -> renderPage(requested, id));
+    }
+
+    // Runs only on the single PDF worker thread. Only one PdfRenderer.Page is open at a time.
+    private void renderPage(int requested, int id) {
         Bitmap bitmap = null;
+        PdfRenderer.Page page = null;
         try {
-            page = renderer.openPage(pageIndex);
-            int availableWidth = Math.max(dp(280), getResources().getDisplayMetrics().widthPixels - dp(24));
-            float scale = Math.min(2.0f, availableWidth / (float) page.getWidth());
-            int width = Math.max(1, (int) (page.getWidth() * scale));
-            int height = Math.max(1, (int) (page.getHeight() * scale));
-            bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+            if (destroyed || renderer == null) return;
+            page = renderer.openPage(requested);
+            int screenWidth = getResources().getDisplayMetrics().widthPixels;
+            int availableWidth = Math.max(1, screenWidth - dp(24));
+            int sourceWidth = page.getWidth();
+            int sourceHeight = page.getHeight();
+
+            // Keep rasterized pages modest in size; huge scanned PDFs can otherwise exhaust RAM.
+            double scale = Math.min(1.5, availableWidth / (double) sourceWidth);
+            double pixelLimitScale = Math.sqrt(3000000.0 / ((double) sourceWidth * sourceHeight));
+            scale = Math.min(scale, pixelLimitScale);
+            scale = Math.max(0.1, scale);
+            int width = Math.max(1, (int) (sourceWidth * scale));
+            int height = Math.max(1, (int) (sourceHeight * scale));
+
+            bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.RGB_565);
             bitmap.eraseColor(Color.WHITE);
             page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY);
-            pageImage.setImageBitmap(bitmap);
-            pageLabel.setText((pageIndex + 1) + " / " + renderer.getPageCount());
+            Bitmap completed = bitmap;
+            bitmap = null;
+            mainHandler.post(() -> {
+                if (destroyed || id != requestId) {
+                    completed.recycle();
+                    return;
+                }
+                Bitmap old = displayedBitmap;
+                displayedBitmap = completed;
+                pageImage.setImageBitmap(completed);
+                pageLabel.setText((requested + 1) + " / " + renderer.getPageCount());
+                if (old != null && old != completed && !old.isRecycled()) old.recycle();
+            });
         } catch (Exception e) {
             if (bitmap != null && !bitmap.isRecycled()) bitmap.recycle();
-            Toast.makeText(this, "Could not render this page.", Toast.LENGTH_SHORT).show();
+            mainHandler.post(() -> {
+                if (!destroyed && id == requestId) {
+                    pageLabel.setText((requested + 1) + " / " + (renderer == null ? "?" : renderer.getPageCount()));
+                    Toast.makeText(this, "Could not render this page. Try another page or close other apps.", Toast.LENGTH_SHORT).show();
+                }
+            });
         } finally {
             if (page != null) page.close();
         }
@@ -118,9 +181,22 @@ public class PdfViewerActivity extends Activity {
 
     @Override
     protected void onDestroy() {
-        if (renderer != null) renderer.close();
-        if (descriptor != null) {
-            try { descriptor.close(); } catch (IOException ignored) {}
+        destroyed = true;
+        requestId++;
+        pdfExecutor.execute(() -> {
+            if (renderer != null) {
+                try { renderer.close(); } catch (Exception ignored) {}
+                renderer = null;
+            }
+            if (descriptor != null) {
+                try { descriptor.close(); } catch (IOException ignored) {}
+                descriptor = null;
+            }
+        });
+        pdfExecutor.shutdown();
+        if (displayedBitmap != null && !displayedBitmap.isRecycled()) {
+            displayedBitmap.recycle();
+            displayedBitmap = null;
         }
         super.onDestroy();
     }
